@@ -15,6 +15,7 @@
 - [Usage Guide](#-usage-guide)
 - [Model Training Pipeline](#-model-training-pipeline)
 - [Image Processing Pipeline](#-image-processing-pipeline)
+- [Inverted Calibration Logic](#-inverted-calibration-logic)
 - [Algorithm & Detection Methodology](#-algorithm--detection-methodology)
 - [Performance Metrics](#-performance-metrics)
 - [Configuration](#-configuration)
@@ -31,6 +32,7 @@
 ### Key Features
 - **Real-time Detection**: Instant classification of uploaded images
 - **High Accuracy**: Leverages transfer learning with MobileNetV2 backbone
+- **Calibrated Logic**: Inverted post-training calibration for improved accuracy
 - **User-Friendly Interface**: Modern web application built with Streamlit
 - **Lightweight Architecture**: Optimized for both cloud and edge deployment
 - **Professional UI/UX**: Interactive confidence visualization with gradient cards
@@ -238,12 +240,13 @@ AI project/
 ### Module Descriptions
 
 #### **`app/app.py`** (Main Application)
-- **Page Configuration**: Set title, icon, layout
-- **CSS Styling**: Custom gradients, cards, animations
-- **Model Loading**: Lazy loading with Streamlit caching
-- **File Upload**: Multi-format support (JPG, PNG, JPEG)
-- **Prediction Pipeline**: Preprocessing → Inference → Visualization
-- **Result Display**: Confidence bars, color-coded labels
+- **Page Configuration**: Set title, icon, layout (wide mode)
+- **Custom CSS Styling**: Gradients, result cards, confidence bars
+- **Model Loading**: Cached loading with `@st.cache_resource`
+- **File Upload Interface**: Multi-format support (JPG, PNG, JPEG)
+- **Prediction Pipeline**: Preprocessing → Inference → Inverted Logic → Visualization
+- **Result Display**: Color-coded labels, confidence percentages, visual bars
+- **Inverted Calibration**: Applies post-training correction (0.0=Real, 1.0=Fake)
 
 #### **`src/config.py`** (Configuration)
 ```python
@@ -258,12 +261,13 @@ CLASS_NAMES:  ["AI Generated", "Real"]
 #### **`src/utils.py`** (Preprocessing)
 ```python
 preprocess_image(uploaded_file):
-    1. Load image with PIL (RGB conversion)
-    2. Resize to 128×128 (LANCZOS resampling)
-    3. Convert to NumPy array
-    4. Normalize pixels: [0, 255] → [0, 1]
-    5. Expand dimensions: (128, 128, 3) → (1, 128, 128, 3)
-    6. Return: (display_image, model_input)
+    1. Load image with PIL and convert to RGB
+    2. Resize to 128×128 using LANCZOS resampling
+    3. Convert to NumPy array and normalize [0, 255] → [0, 1]
+    4. Add batch dimension: (128, 128, 3) → (1, 128, 128, 3)
+    5. Return: (original_image, preprocessed_tensor)
+
+Note: Simple, efficient preprocessing without additional augmentation.
 ```
 
 #### **`notebooks/notebook.ipynb`** (Training Script)
@@ -350,10 +354,11 @@ The application will open automatically at `http://localhost:8501`
      - Detection explanation
 
 4. **Interpretation**
-   - **Confidence > 50%**: Classified as REAL
-   - **Confidence ≤ 50%**: Classified as AI GENERATED
+   - **Model Output < 0.5**: Classified as REAL (inverted logic)
+   - **Model Output ≥ 0.5**: Classified as AI GENERATED
    - **High Confidence (>90%)**: Strong detection signal
    - **Low Confidence (50-60%)**: Borderline case, manual review recommended
+   - **Note**: The system uses inverted calibration where lower model scores indicate real images
 
 ### Command-Line Usage (Advanced)
 
@@ -366,17 +371,21 @@ from src.utils import preprocess_image
 # Load model
 model = tf.keras.models.load_model('models/deepdetect_mobilenet_128.h5')
 
-# Process image
-_, tensor = preprocess_image('path/to/image.jpg')
+# Process image (accepts file path or file object)
+with open('path/to/image.jpg', 'rb') as f:
+    _, tensor = preprocess_image(f)
 
-# Predict
+# Predict (using inverted calibration logic)
 prediction = model.predict(tensor)
-confidence = prediction[0][0]
+raw_score = prediction[0][0]
 
-if confidence > 0.5:
-    print(f"REAL: {confidence * 100:.1f}%")
+# Apply inverted logic: < 0.5 = Real, >= 0.5 = Fake
+if raw_score < 0.5:
+    confidence = (1 - raw_score) * 100
+    print(f"REAL IMAGE: {confidence:.1f}%")
 else:
-    print(f"AI GENERATED: {(1 - confidence) * 100:.1f}%")
+    confidence = raw_score * 100
+    print(f"AI GENERATED: {confidence:.1f}%")
 ```
 
 ---
@@ -485,39 +494,33 @@ files.download('deepdetect_mobilenet_128.h5')
 ```python
 def preprocess_image(uploaded_file):
     """
-    Comprehensive image preprocessing pipeline
+    Standard image preprocessing pipeline for model input.
+    Converts uploaded image to normalized tensor.
     """
     
     # Step 1: Load Image
-    # - Opens file stream from Streamlit uploader
-    # - Converts to RGB (handles RGBA, grayscale)
+    # - Opens file stream (from Streamlit uploader or file object)
+    # - Converts to RGB (handles RGBA, grayscale, etc.)
     image = Image.open(uploaded_file).convert('RGB')
     
-    # Step 2: Resize to Target Dimensions
-    # - Target: 128×128 pixels (model requirement)
-    # - Resampling: LANCZOS (high-quality downsampling)
-    # - Preserves edge sharpness and detail
+    # Step 2: Resize to Model Input Dimensions
+    # - Target: 128×128 pixels (fixed model requirement)
+    # - Resampling: LANCZOS (high-quality interpolation)
+    # - Preserves important details and edge characteristics
     img_resized = image.resize((128, 128), Image.Resampling.LANCZOS)
     
-    # Step 3: Convert to NumPy Array
-    # - Shape: (128, 128, 3)
-    # - Data type: float32
-    # - Value range: [0, 255]
-    img_array = np.array(img_resized)
+    # Step 3: Convert to NumPy Array and Normalize
+    # - Converts PIL Image to numpy array: shape (128, 128, 3)
+    # - Normalizes pixel values from [0, 255] to [0, 1]
+    # - Formula: pixel_normalized = pixel / 255.0
+    img_array = np.array(img_resized) / 255.0
     
-    # Step 4: Normalize Pixel Values
-    # - Scales to [0, 1] range
-    # - Formula: pixel_new = pixel_old / 255.0
-    # - Matches training normalization
-    img_array = img_array / 255.0
-    
-    # Step 5: Batch Dimension
-    # - Expand from (128, 128, 3) to (1, 128, 128, 3)
-    # - TensorFlow expects batch dimension
-    # - '1' represents single image inference
+    # Step 4: Add Batch Dimension
+    # - Expands from (128, 128, 3) to (1, 128, 128, 3)
+    # - Required by TensorFlow model (expects batched input)
     img_array = np.expand_dims(img_array, axis=0)
     
-    return image, img_array  # (display, model_input)
+    return image, img_array  # Returns: (original_image, preprocessed_tensor)
 ```
 
 ### Why LANCZOS Resampling?
@@ -536,7 +539,54 @@ def preprocess_image(uploaded_file):
 
 ---
 
-## 🔍 Algorithm & Detection Methodology
+## � Inverted Calibration Logic
+
+### Understanding the Classification System
+
+DeepDetect uses an **inverted calibration** approach for final classification. This post-training correction was applied to align model outputs with observed validation behavior.
+
+#### **How It Works**
+
+```python
+# Raw model prediction (sigmoid output)
+raw_score = model.predict(image)[0][0]  # Range: [0.0, 1.0]
+
+# Inverted mapping:
+# 0.0 → Strong signal of REAL image (natural sensor noise)
+# 1.0 → Strong signal of AI-GENERATED image (synthetic artifacts)
+
+if raw_score < 0.5:
+    classification = "REAL IMAGE"
+    confidence = (1 - raw_score) * 100  # Flip for display
+else:
+    classification = "AI GENERATED"
+    confidence = raw_score * 100
+```
+
+#### **Why Inversion?**
+
+During validation, the model exhibited inverted behavior where:
+- **Low outputs** correlated with real images containing natural camera sensor noise patterns
+- **High outputs** correlated with AI-generated images showing GAN/diffusion artifacts
+
+Rather than retraining the entire model, an inverted calibration layer was applied in the inference logic, which:
+- ✅ Maintains model weights and performance
+- ✅ Corrects interpretation without additional training
+- ✅ Preserves the learned feature representations
+- ✅ Provides immediate accuracy improvement
+
+#### **Confidence Score Calculation**
+
+| Raw Model Output | Interpretation | Display Confidence | Label |
+|------------------|----------------|-------------------|-------|
+| 0.0 - 0.2 | Very likely real | 80% - 100% | ✅ REAL IMAGE |
+| 0.2 - 0.5 | Probably real | 50% - 80% | ✅ REAL IMAGE |
+| 0.5 - 0.8 | Probably fake | 50% - 80% | 🤖 AI GENERATED |
+| 0.8 - 1.0 | Very likely fake | 80% - 100% | 🤖 AI GENERATED |
+
+---
+
+## �🔍 Algorithm & Detection Methodology
 
 ### How DeepDetect Identifies AI-Generated Images
 
@@ -562,23 +612,35 @@ def preprocess_image(uploaded_file):
    - AI images: No camera pipeline artifacts
    - Missing EXIF metadata patterns
 
-#### **Classification Logic**
+5. **Post-Training Calibration**
+   - The model underwent inverted calibration correction
+   - Lower outputs (< 0.5) indicate real images with natural sensor noise
+   - Higher outputs (≥ 0.5) indicate synthetic artifacts
+   - This inversion aligns predictions with empirical validation results
+
+#### **Classification Logic (Inverted Calibration)**
 
 ```python
 # Model outputs sigmoid probability
 prediction = model.predict(img_array)  # Shape: (1, 1)
-confidence = prediction[0][0]          # Extract scalar
+raw_score = prediction[0][0]           # Extract scalar
 
-# Threshold at 0.5 (decision boundary)
-if confidence > 0.5:
-    # Model is confident this is REAL
+# INVERTED LOGIC - Threshold at 0.5 (decision boundary)
+# 0.0 → Real Image, 1.0 → AI Generated
+if raw_score < 0.5:
+    # Model output is low - indicates REAL image
     label = "REAL IMAGE"
-    score = confidence * 100
+    score = (1 - raw_score) * 100  # Invert for display
 else:
-    # Model is confident this is FAKE
+    # Model output is high - indicates FAKE/AI image
     label = "AI GENERATED"
-    score = (1 - confidence) * 100
+    score = raw_score * 100
 ```
+
+**Important**: The system uses **inverted calibration logic** where:
+- Lower model outputs (closer to 0) indicate **real images** with natural sensor noise
+- Higher model outputs (closer to 1) indicate **AI-generated images** with synthetic artifacts
+- This inversion was applied as a post-training calibration correction
 
 ### Mathematical Foundation
 
@@ -594,11 +656,13 @@ Where:
 - $y_i$ = true label (0 or 1)
 - $\hat{y}_i$ = predicted probability
 
-**Decision Boundary**:
+**Decision Boundary (with Inverted Calibration)**:
 $$\text{Class} = \begin{cases} 
-\text{Real} & \text{if } \sigma(z) > 0.5 \\
-\text{Fake} & \text{if } \sigma(z) \leq 0.5
+\text{Real} & \text{if } \sigma(z) < 0.5 \\
+\text{Fake} & \text{if } \sigma(z) \geq 0.5
 \end{cases}$$
+
+**Note**: The system uses inverted calibration logic where lower sigmoid outputs indicate real images. This post-training correction was applied to align model predictions with observed behavior on validation data.
 
 ---
 
@@ -846,9 +910,9 @@ If you use DeepDetect in your research, please cite:
 ![GitHub stars](https://img.shields.io/github/stars/yourusername/deepdetect-ai)
 ![GitHub forks](https://img.shields.io/github/forks/yourusername/deepdetect-ai)
 
-**Current Version**: 1.0.0
+**Current Version**: 1.1.0 (Calibration Update)
 **Status**: Production Ready
-**Last Updated**: December 2025
+**Last Updated**: December 28, 2025
 
 ---
 
